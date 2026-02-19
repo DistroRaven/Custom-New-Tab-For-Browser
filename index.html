@@ -206,6 +206,7 @@ body::after{
   position:absolute;
   width:65px; height:65px;
   border-radius:18px;
+  will-change: transform;
 
   display:grid;
   place-items:center;
@@ -380,12 +381,21 @@ const SPEED_NORMAL = 0.2;
 const SPEED_TYPING = 0.3;
 const TYPING_DECAY_MS = 700;
 const SPEED_SMOOTHING = 9;
+const SCALE_X = 1200 / (GRID_W - 1);
+const SCALE_Y = 800 / (GRID_H - 1);
 
 let seed = Math.random() * 1000;
 let tAcc = 0;
 let speedCurrent = SPEED_NORMAL;
 let speedTarget = SPEED_NORMAL;
 let typingTimer = null;
+let contourPaths = [];
+
+const fieldGrid = new Float32Array(GRID_W * GRID_H);
+const gridIndex = (x, y) => y * GRID_W + x;
+const ISO_VALUES = Array.from({ length: ISO_LEVELS }, (_, idx) =>
+  ISO_CENTER + (idx - (ISO_LEVELS - 1) / 2) * ISO_STEP
+);
 
 function smoothToTarget(current, target, dt, smoothing) {
   const alpha = 1 - Math.exp(-smoothing * dt);
@@ -418,14 +428,15 @@ function interp(x1, y1, v1, x2, y2, v2, iso) {
   return { x: x1 + (x2 - x1) * tt, y: y1 + (y2 - y1) * tt };
 }
 
-function marchingSquares(grid, iso) {
+function marchingSquares(grid, iso, sx, sy) {
   const segs = [];
+  const at = (x, y) => grid[gridIndex(x, y)];
   for (let y = 0; y < GRID_H - 1; y++) {
     for (let x = 0; x < GRID_W - 1; x++) {
-      const vTL = grid[y][x];
-      const vTR = grid[y][x + 1];
-      const vBR = grid[y + 1][x + 1];
-      const vBL = grid[y + 1][x];
+      const vTL = at(x, y);
+      const vTR = at(x + 1, y);
+      const vBR = at(x + 1, y + 1);
+      const vBL = at(x, y + 1);
 
       let c = 0;
       if (vTL >= iso) c |= 8;
@@ -440,6 +451,11 @@ function marchingSquares(grid, iso) {
       const ptRight = interp(x1, y0, vTR, x1, y1, vBR, iso);
       const ptBottom = interp(x0, y1, vBL, x1, y1, vBR, iso);
       const ptLeft = interp(x0, y0, vTL, x0, y1, vBL, iso);
+
+      ptTop.x *= sx; ptTop.y *= sy;
+      ptRight.x *= sx; ptRight.y *= sy;
+      ptBottom.x *= sx; ptBottom.y *= sy;
+      ptLeft.x *= sx; ptLeft.y *= sy;
 
       switch (c) {
         case 1: segs.push([ptLeft, ptBottom]); break;
@@ -554,6 +570,7 @@ function polylineToPathD(points, closeIfLoop = true) {
 
 function generateContourPaths() {
   contoursGroup.innerHTML = '';
+  contourPaths = [];
 
   function weightedStrokeWidth() {
     const r = Math.random();
@@ -575,36 +592,27 @@ function generateContourPaths() {
     path.setAttribute('stroke-width', weightedStrokeWidth());
     path.setAttribute('fill', 'none');
     contoursGroup.appendChild(path);
+    contourPaths.push(path);
   }
 }
 
 function renderContours(t) {
-  const grid = Array.from({ length: GRID_H }, (_, y) =>
-    Array.from({ length: GRID_W }, (_, x) => field(x, y, t, seed))
-  );
+  for (let y = 0; y < GRID_H; y++) {
+    for (let x = 0; x < GRID_W; x++) {
+      fieldGrid[gridIndex(x, y)] = field(x, y, t, seed);
+    }
+  }
 
-  const sx = 1200 / (GRID_W - 1);
-  const sy = 800 / (GRID_H - 1);
-  const paths = contoursGroup.querySelectorAll('path');
-  const mid = (ISO_LEVELS - 1) / 2;
+  contourPaths.forEach((path, idx) => {
+    const segs = marchingSquares(fieldGrid, ISO_VALUES[idx], SCALE_X, SCALE_Y);
+    const polylines = stitchSegments(segs);
 
-  paths.forEach((path, idx) => {
-    const iso = ISO_CENTER + (idx - mid) * ISO_STEP;
-    const segs = marchingSquares(grid, iso);
-
-    const scaledSegs = segs.map(([p0, p1]) => ([
-      { x: p0.x * sx, y: p0.y * sy },
-      { x: p1.x * sx, y: p1.y * sy }
-    ]));
-
-    const polylines = stitchSegments(scaledSegs);
-
-    let d = '';
+    const pathParts = [];
     for (const line of polylines) {
       if (line.length < 3) continue;
-      d += polylineToPathD(line, true) + ' ';
+      pathParts.push(polylineToPathD(line, true));
     }
-    path.setAttribute('d', d.trim());
+    path.setAttribute('d', pathParts.join(' '));
   });
 }
 
@@ -643,14 +651,13 @@ function initChips() {
   const startX = (availableWidth - totalNeeded) / 2 + chipSize / 2;
 
   const state = chips.map((chip, i) => {
-    const rect = chip.getBoundingClientRect();
     return {
       el: chip,
       x: startX + i * (chipSize + desiredGap),
       y: container.clientHeight * 0.5,
       vx: 0,
       vy: 0,
-      r: Math.max(rect.width, rect.height) * 0.5,
+      r: chipSize * 0.5,
       wobble: Math.random() * Math.PI * 2
     };
   });
@@ -669,8 +676,17 @@ function initChips() {
   };
 
   const clamp = (val, min, max) => Math.max(min, Math.min(max, val));
+  let cw = container.clientWidth;
+  let ch = container.clientHeight;
+
+  function updateContainerMetrics() {
+    cw = container.clientWidth;
+    ch = container.clientHeight;
+  }
+  window.addEventListener('resize', updateContainerMetrics);
 
   function updateChipPositions() {
+    updateContainerMetrics();
     state.forEach(s => {
       s.wobble += 0.03;
 
@@ -679,7 +695,7 @@ function initChips() {
 
       s.vx += (Math.random() - 0.5) * config.noise;
       s.vy += (Math.random() - 0.5) * config.noise;
-      s.vy += (container.clientHeight * 0.6 - s.y) * config.snapBack;
+      s.vy += (ch * 0.6 - s.y) * config.snapBack;
 
       s.vx = clamp(s.vx, -config.maxSpeed, config.maxSpeed);
       s.vy = clamp(s.vy, -config.maxSpeed, config.maxSpeed);
@@ -688,9 +704,9 @@ function initChips() {
       s.y += s.vy + wobbleY * 0.03;
 
       const left = config.margin + s.r;
-      const right = container.clientWidth - config.margin - s.r;
+      const right = cw - config.margin - s.r;
       const top = config.margin + s.r;
-      const bottom = container.clientHeight - config.margin - s.r;
+      const bottom = ch - config.margin - s.r;
 
       if (s.x < left) { s.x = left; s.vx *= -1; }
       if (s.x > right) { s.x = right; s.vx *= -1; }
